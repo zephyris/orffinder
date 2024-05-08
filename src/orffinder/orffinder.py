@@ -1,4 +1,4 @@
-import os, sys, subprocess, statistics
+import os, sys, subprocess, statistics, multiprocessing
 
 class BlastHit:
     """
@@ -25,21 +25,32 @@ class BlastHit:
 class Blast:
     """
     Object to handle BLAST indexing and searching.
-    ncbi-blast+ and/or diamond must be installed and the various programs available in path.
+    ncbi-blast+ must be installed and the various programs available in path.
     """
-    def __init__(self, subject_path, db_type, do_indexing=True):
+    def __init__(self, subject_path, db_type, program_type, max_hits=None, do_indexing=True):
         self.subject_path = subject_path
-        db_types = ["nucl", "prot"]
-        self.db_type = db_type
+        db_types = {
+            "nucl": ["blastn", "tblastn"],
+            "prot": ["blastp", "blastx"]
+        }
+        self.db_type = db_type.lower()
         if self.db_type not in db_types:
             exit("Error: Unrecognised BLAST database type:", self.db_type)
+        index_suffices_suffices = ["hr", "in", "sq", "db", "ot", "tf", "to"]
         self.index_suffices = {
-            "nucl": [".nhr", ".nin", ".nsq", ".ndb", ".not", ".ntf", ".nto"],
-            "prot": [".phr", ".pin", ".psq", ".pdb", ".pot", ".ptf", ".pto"]
+            "nucl": [".n" + x for x in index_suffices_suffices],
+            "prot": [".p" + x for x in index_suffices_suffices]
         }
+        self.program_type = program_type.lower()
+        if program_type not in db_types[self.db_type]:
+            exit("Error: Unrecognised BLAST program name:", program_type, "for database type:", self.db_type)
         if do_indexing:
             self.makeIndex()
         self.searchprocess = None
+        self.max_hits = max_hits
+        # search queue for batch searches
+        self.batch_search_queue = []
+        self.batch_search_result = {}
     
     def makeIndex(self):
         """
@@ -73,17 +84,58 @@ class Blast:
             exit("Error: Unrecognised BLAST hit attribute:", sortby)
         return sorted(hits, key=lambda x: getattr(x, sortby), reverse=reverse)
     
-    def doSearch(self, program_type, query_lines):
+    def doSearch(self, query_lines):
         """
-        Set up a search against subject_path using the appropriate BLAST program
+        Do a search using query against subject_path
         """
-        program_types = ["blastp", "blastn", "tblastn", "blastx"]
-        if program_type not in program_types:
-            exit("Error: Unrecognised BLAST program name:", program_type)
-        
-        self.searchprocess = subprocess.Popen([program_type, "-db", self.subject_path, "-outfmt", "6"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.PIPE, text=True)
+        self.searchprocess = subprocess.Popen([self.program_type, "-db", self.subject_path, "-outfmt", "6", "-num_threads", str(multiprocessing.cpu_count())], stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.PIPE, text=True)
         stdout_lines = self.searchprocess.communicate(input=query_lines)[0].splitlines()
+        if self.max_hits is not None:
+            stdout_lines = stdout_lines[:self.max_hits]
         return self.sortBlastHits([BlastHit(x) for x in stdout_lines])
+    
+    def queueBatchSearch(self, query_lines):
+        """
+        Queue a search using query against subject_path, indexed in queue by query id
+        """
+        query_fasta = Fasta(string=query_lines)
+        for query_id in query_fasta.sequences:
+            if query_id not in self.batch_search_queue and query_id not in self.batch_search_result:
+                self.batch_search_queue.append(query_fasta.sequences[query_id].fasta())
+    
+    def getBatchSearch(self, query_lines):
+        """
+        Get the results of a batch search, returned as a dict indexed by query id
+        """
+        self.queueBatchSearch(query_lines)
+        if len(self.batch_search_queue) > 0:
+            self.triggerBatchSearch()
+        query_ids = Fasta(string=query_lines).sequences.keys()
+        results = {}
+        for query_id in query_ids:
+            if query_id in self.batch_search_result:
+                results[query_id] = self.batch_search_result[query_id]
+            else:
+                results[query_id] = []
+        return results
+
+    def triggerBatchSearch(self):
+        """
+        Trigger a batch search of the queued queries and append to batch_search_result
+        """
+        results = self.doSearch("\n".join(self.batch_search_queue)+"\n")
+        self.batch_search_queue = []
+        for result in results:
+            if result.qseqid not in self.batch_search_result:
+                self.batch_search_result[result.qseqid] = []
+            self.batch_search_result[result.qseqid].append(result)
+    
+    def clearBatchSearch(self):
+        """
+        Clear the batch search queue and result
+        """
+        self.batch_search_queue = []
+        self.batch_search_result = {}
 
 class Orf:
     """
@@ -112,7 +164,7 @@ class Orf:
         return self.sequence.sequencename + "_" + str(self.start) + "-" + str(self.stop) + "-" + ("f" if self.forward else "r")
 
     def fasta(self):
-        return "\n".join([">" + self.orfname() if self.forward else "r", self.protseq(), ""])
+        return "\n".join([">" + self.orfname(), self.protseq(), ""])
     
     def orfLengthPvalue(self):
         """
@@ -160,7 +212,7 @@ class Orf:
         """
         Test all start codons in altstarts for a dropoff in tBLASTn bitscore, and set the start cdon to the first non-outlier
         Score each start-start and final start-stop codon segment by bitscore per amino acid
-        Make extend rightwards to 25 amino acids for short segments
+        Extend rightwards to minquerylength amino acids for short segments
         """
         def stdev(list):
             list = [x for x in list if x is not None]
@@ -169,6 +221,7 @@ class Orf:
             list = [x for x in list if x is not None]
             return statistics.mean(list) if len(list) > 0 else None
 
+        thresholdstdevs = 1.5 # threshold for outlier detection
         minquerylength = 25 * 3 # 25 amino acids, 3 nucleotides per codon
         zerohitsbitscore = 0 # bitscore to impute for no BLAST hits
         # make query segments starting at each start codon
@@ -181,25 +234,30 @@ class Orf:
             if rawranges[index + 1] - rawranges[index] < minquerylength:
                 end = min(rawranges[index] + minquerylength, rawranges[-1])
             ranges.append((start, end))
-        hits = []
+        scores = []
         # do blast search for each segment
+        seqs = []
+        for index in range(len(ranges)):#
+            seqs.append(DnaSequence(self.dnaseq().forward[ranges[index][0]:ranges[index][1]], sequencename=self.orfname() + "_startindex" + str(index)))
+            blast.queueBatchSearch(seqs[-1].fastaProt())
         for index in range(len(ranges)):
-            dnaseq = DnaSequence(self.dnaseq().forward[ranges[index][0]:ranges[index][1]])
-            result = blast.doSearch("tblastn", dnaseq.fastaProt())
-            hit = zerohitsbitscore
+            result = blast.getBatchSearch(seqs[index].fastaProt())[seqs[index].sequencename]
+            score = zerohitsbitscore
             if len(result) > 0:
-                hit = result[0].bitscore / dnaseq.length() # normalise by length
-            hits.append(hit)
-        # search for first non-outlier start codon (2 stdev below mean or no hit)
-        mean, stdev = mean(hits), stdev(hits)
+                score = result[0].bitscore / seqs[index].length() # normalise by length
+            scores.append(score)
+        # search for first non-outlier start codon
+        mean, stdev = mean(scores), stdev(scores)
+        threhsold = mean - thresholdstdevs * stdev
         index = 0
-        while hits[index] < mean - stdev and index < len(hits) - 1:
+        while scores[index] < threhsold and index < len(scores) - 1:
             index += 1
         changed = self.altstarts[index] != self.start
         # set output
         self.start = self.altstarts[index] if index < len(self.altstarts) else self.stop
         self.length = self.stop - self.start
         # return report
+        #if changed: print([round(x, 3) for x in [mean, stdev, threhsold]], [round(x, 3) for x in scores])
         return changed, index
 
 class DnaSequence:
@@ -313,16 +371,15 @@ class DnaSequence:
 class OrfFinder:
     def __init__(self, reference_genomes_path, query_fasta_path, verbosity=2):
         self.query_fasta = Fasta(path=query_fasta_path)
-        self.blast = Blast(reference_genomes_path, "nucl")
+        self.blast = Blast(reference_genomes_path, "nucl", "tblastn")
         self.verbosity = verbosity
     
-    def allGoodOrfs(self, minlength=150, searchrevcompl=True):
+    def allGoodOrfs(self, minlength=300, thresholdbitscore=35, searchrevcompl=True):
         """
-        Returns the best ORFs in the query fasta, preserving long ORFs, removing overlapping and low bitscore ORFs.
-        Checks the remaining ORFs for the best start codon.
+        Returns the best ORFs in the query fasta, preserving long ORFs, removing overlapping and low tBLASTn bitscore ORFs.
+        Checks the remaining ORFs for the best start codon using tBLASTn.
         Suited for finding all ORFs in a genome.
         """
-        thresholdbitscore = 35
         result = {}
         for sequence in self.query_fasta.sequences:
             if self.verbosity > 1: print("Sequence:", sequence)
@@ -339,15 +396,16 @@ class OrfFinder:
             orfs = [x for x in filteredorfs if x is not None]
             if self.verbosity > 1: print("", "Longest non-overlapping:", len(orfs))
             # second, remove ORFs with low blast bitscore (< thresholdbitscore)
-            filteredorfs = orfs.copy()
+            filteredorfs = [x for x in orfs if x.protseq() is not None]
             for orf in orfs:
-                if orf.protseq() is None:
+                # queue query for batch search
+                self.blast.queueBatchSearch(orf.fasta())
+            for orf in orfs:
+                # get batch search results and parse
+                blastresult = self.blast.getBatchSearch(orf.fasta())[orf.orfname()]
+                bitscore = blastresult[0].bitscore if len(blastresult) > 0 else 0
+                if bitscore < thresholdbitscore:
                     filteredorfs.remove(orf)
-                else:
-                    blastresult = self.blast.doSearch("tblastn", orf.fasta())
-                    bitscore = blastresult[0].bitscore if len(blastresult) > 0 else 0
-                    if bitscore < thresholdbitscore:
-                        filteredorfs.remove(orf)
             orfs = filteredorfs
             if self.verbosity > 1: print("", "Passed tBLASTn filtering:", len(orfs))
             # finally, adjust start codon for each ORF
@@ -359,10 +417,10 @@ class OrfFinder:
                 result[sequence] = orfs
         return result
     
-    def bestOrf(self, minlength=150):
+    def bestOrf(self, minlength=300):
         """
         Returns the longest, leftmost (first) and best tBLASTn hit ORF for each sequence in the query FASTA.
-        Checks the best hit for the best start codon.
+        Checks the best hit for the best start codon using tBLASTn.
         Suited for finding the best ORF in a transcript.
         """
         def orfByName(orfs, name):
@@ -379,7 +437,7 @@ class OrfFinder:
             if len(orfs) > 0:
                 longest = sorted(orfs, key=lambda x: x.length, reverse=True)[0] # longest ORF found
                 first = sorted(orfs, key=lambda x: x.start, reverse=False)[0] # leftmost ORF found
-                blasthits = self.blast.doSearch("tblastn", "\n".join(x.fasta() for x in orfs))
+                blasthits = self.blast.doSearch("\n".join(x.fasta() for x in orfs)) # tBLASTn all orfs to find best hit
                 blastbitscore = blasthits[0].bitscore if len(blasthits) > 0 else 0
                 blastevalue = blasthits[0].evalue if len(blasthits) > 0 else None
                 blasthit = orfByName(orfs, blasthits[0].qseqid) if len(blasthits) > 0 else None # top bitscore-sorted tBLASTn hit
@@ -428,7 +486,7 @@ class Fasta:
             self.sequences = {x.splitlines()[0].split(" ")[0]: DnaSequence("".join(x.splitlines()[1:]), sequencename=x.splitlines()[0].split(" ")[0]) for x in self.string.split(">")[1:]}
     
     def fasta(self):
-        "\n".join([">" + x[0] + "\n" + x[1] for x in self.sequences.items()])
+        return "\n".join([">" + x[0] + "\n" + x[1] for x in self.sequences.items()])
 
 if __name__ == "__main__":
     if len(sys.argv) < 4:
