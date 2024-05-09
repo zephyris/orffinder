@@ -22,6 +22,12 @@ winget install Python.Python.3.0; winget install Git.Git
 python3 -m pip install -update pip
 ```
 
+Alternatively, `blast+` can be installed in a conda environment by running
+```shell
+conda install -c bioconda blast
+```
+Please see the [Conda documentation](https://conda.io/projects/conda/en/latest/user-guide/install/index.html) on how to install conda.
+
 ### OrfFinder
 
 Install using `pip` and `git`:
