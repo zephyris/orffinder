@@ -1,5 +1,5 @@
 import os, sys, subprocess, statistics, multiprocessing
-from functools import cached_property
+#from functools import cached_property
 
 class BlastHit:
     """
@@ -53,6 +53,7 @@ class Blast:
         # search queue and results for batch searches
         self.batch_search_queue = []
         self.batch_search_result = {}
+        self.verbosity=2
     
     def makeIndex(self):
         """
@@ -90,6 +91,7 @@ class Blast:
         """
         Do a search using a list of queries (with .fasta() and .sequenceName() methods) against subject_path.
         """
+        if self.verbosity > 1: print("BLAST", "BLASTing")
         self.searchprocess = subprocess.Popen([self.program_type, "-db", self.subject_path, "-outfmt", "6", "-num_threads", str(multiprocessing.cpu_count())], stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.PIPE, text=True)
         stdout_lines = self.searchprocess.communicate(input="\n".join([query.fasta() for query in queries]))[0].splitlines()
         # limit hits if max_hits set
@@ -101,19 +103,24 @@ class Blast:
         """
         Queue a search using queries against subject_path.
         """
+        print("query", [query.sequenceName() for query in queries])
+        print("queue", [query.sequenceName() for query in self.batch_search_queue])
+        print("result", [key for key in self.batch_search_result])
         # queue queries if not already queued or in results
         for query in queries:
             if query not in self.batch_search_queue and query.sequenceName() not in self.batch_search_result:
                 self.batch_search_queue.append(query)
+        if self.verbosity > 1: print("BLAST", "Queries:", len(queries), "Queued:", len(self.batch_search_queue))
     
     def getBatchSearch(self, queries):
         """
         Get the results of a batch search, returned as a dict indexed by query sequence name.
         """
-        # queue queries, whcih checks for duplication
+        # queue queries, which checks for duplication
         self.queueBatchSearch(queries)
         # trigger search if there are unprocessed queued queries
         if len(self.batch_search_queue) > 0:
+            if self.verbosity > 1: print("BLAST", "Queries:", len(queries), "Batch search, results missing:", len(self.batch_search_queue))
             self.triggerBatchSearch()
         # get results and return as dict by sequence name
         query_names = [query.sequenceName() for query in queries]
@@ -137,6 +144,8 @@ class Blast:
             if result.qseqid not in self.batch_search_result:
                 self.batch_search_result[result.qseqid] = []
             self.batch_search_result[result.qseqid].append(result)
+        print("------")
+        if self.verbosity > 1: ("BLAST", "Results:", len(self.batch_search_result))
     
     def clearBatchSearch(self):
         """
@@ -149,14 +158,21 @@ class Orf:
     """
     ORF object, used by NuclSequence, representing a single open reading frame in a DNA sequence with a maximal extent start and stop and alternative start codons.
     Works with the forward strand, so reverse complement the sequence if necessary and coordinates are in the reverse direction.
+    Must be instatiated with a blast object for tBLASTn searches.
     """
-    def __init__(self, sequence:str, start:int, stop:int, forward:str, altstarts:list=[]):
+    def __init__(self, sequence:str, start:int, stop:int, forward:str, blast, altstarts:list=[]):
         self.sequence = sequence # parent chromosome/contig/mRNA sequence
         self.start = start
         self.stop = stop
         self.forward = forward # True if forward strand, False if reverse strand
         self.length = self.stop - self.start
-        self.altstarts = sorted(altstarts)
+        self.blast = blast
+        if len(altstarts) > 0:
+            self.altstarts = sorted(altstarts)
+        else:
+            self.findOrfsFromStop()
+            self.selectLongest()
+        self.testRanges = self.blastTestRanges()
         self.frame = stop % 3
     
     def __repr__(self):
@@ -213,26 +229,28 @@ class Orf:
         """
         Set the start codon to the longest ORF defined by altstarts
         """
-        self.start = self.altstarts[-1]
+        if len(self.altstarts) > 0:
+            self.start = self.altstarts[-1]
+        else:
+            self.start = self.stop
         self.length = self.stop - self.start
 
-    def blastTestStart(self, blast):
+    def blastTestSeqs(self, ranges:list):
+        seqs = []
+        for index in range(len(ranges)):
+            seqs.append(ProtSequence(self.dnaseq().protein().sequence[ranges[index][0]//3:ranges[index][1]//3], sequence_name=self.sequenceName() + "_startindex" + str(index)))
+        return seqs
+
+    def blastTestRanges(self):
         """
-        Test all start codons in altstarts for a dropoff in tBLASTn bitscore, and set the start cdon to the first non-outlier
-        Score each start-start and final start-stop codon segment by bitscore per amino acid
+        Set up all blast queries for each start codon in altstarts, ready for selectBestByBlast().
+        Select a test sequence starting at all start codons in altstarts.
         Extend rightwards to minquerylength amino acids for short segments
         """
-        def stdev(list):
-            list = [x for x in list if x is not None]
-            return statistics.stdev(list) if len(list) > 1 else 0
-        def mean(list):
-            list = [x for x in list if x is not None]
-            return statistics.mean(list) if len(list) > 0 else None
-
-        thresholdstdevs = 1.5 # threshold for outlier detection
         minquerylength = 25 * 3 # 25 amino acids, 3 nucleotides per codon
-        zerohitsbitscore = 0 # bitscore to impute for no BLAST hits
         # make query segments starting at each start codon
+        if self.length == 0:
+            return []
         rawranges = [x - self.start for x in self.altstarts + [self.stop]]
         # derive start/end ranges, extend rightward to minimum query length if too short
         ranges = []
@@ -242,13 +260,34 @@ class Orf:
             if rawranges[index + 1] - rawranges[index] < minquerylength:
                 end = min(rawranges[index] + minquerylength, rawranges[-1])
             ranges.append((start, end))
+        # queue a blast search for each segment
+        seqs = self.blastTestSeqs(ranges)
+        self.blast.queueBatchSearch(seqs)
+        return ranges
+
+    def selectBestByBlast(self, blast):
+        """
+        Test all start codons in altstarts for a dropoff in tBLASTn bitscore, and set the start cdon to the first non-outlier
+        Score each start-start and final start-stop codon segment by bitscore per amino acid
+        """
+        def stdev(list):
+            list = [x for x in list if x is not None]
+            return statistics.stdev(list) if len(list) > 1 else 0
+        def mean(list):
+            list = [x for x in list if x is not None]
+            return statistics.mean(list) if len(list) > 0 else None
+
+        # TODO: Change from outlier-based to a simple score-based method
+        thresholdstdevs = 1.5 # threshold for outlier detection
+        zerohitsbitscore = 0 # bitscore to impute for no BLAST hits
+        # re-create sequence queries
+        seqs = self.blastTestSeqs(self.testRanges)
+        # do actual search
         scores = []
-        # do blast search for each segment
-        seqs = []
-        for index in range(len(ranges)):
-            seqs.append(ProtSequence(self.dnaseq().protein().sequence[ranges[index][0]//3:ranges[index][1]//3], sequence_name=self.sequenceName() + "_startindex" + str(index)))
-        for index in range(len(ranges)):
-            result = blast.getBatchSearch([seqs[index]])[seqs[index].sequenceName()]
+        print("----")
+        for index in range(len(self.testRanges)):
+            result = self.blast.getBatchSearch([seqs[index]])[seqs[index].sequenceName()]
+            print(seqs[index], seqs[index].sequenceName())
             score = zerohitsbitscore
             if len(result) > 0:
                 score = result[0].bitscore / seqs[index].length() # normalise by length
@@ -352,10 +391,11 @@ class NuclSequence:
     def isOrf(self):
         return self.startCodon() and self.stopCodon() and not self.containsNs() and self.inFrame()
     
-    def findOrfs(self, min_length:int=150, search_rev_compl:bool=False):
+    def findOrfs(self, blast, min_length:int=150, search_rev_compl:bool=False):
         """
         Finds ORFs by finding stop codons and finding the furthest upstream start codon without an intervening in-frame stop
-        Only returns ORFs over min_length bases (min_length / 3 amino acids) long
+        Returns a list of Orf objects. Only returns ORFs over min_length bases (min_length / 3 amino acids) long.
+        Must be instantiated with a blast object for tBLASTn searches.
         """
         def searchStrand(sequence, min_length, is_rev_compl=False):
             # search reverse complement for reverse strand ORFs, resulting coordinates are on reverse sequence
@@ -371,10 +411,8 @@ class NuclSequence:
             # find longest orf for each stop, and all possible alternate starts
             hits = []
             for stop in stops:
-                # for each stop, set up a stub of an ORF from the stop codon
-                hit = Orf(NuclSequence(forward, sequence_name=sequence.sequence_name), stop, stop, not is_rev_compl, altstarts=[])
-                # find all possible start codons upstream from the stop
-                hit.findOrfsFromStop()
+                # for each stop, set up a stub of an ORF from the stop codon, which will automatically find all possible start codons
+                hit = Orf(NuclSequence(forward, sequence_name=sequence.sequence_name), stop, stop, not is_rev_compl, blast)
                 if hit.length > min_length:
                     # if sufficiently long (no upstream start codon gives length zero), add to hits
                     hits.append(hit)
@@ -430,7 +468,7 @@ class OrfFinder:
         result = {}
         for sequence in self.query_fasta.sequences:
             if self.verbosity > 1: print("Sequence:", sequence)
-            orfs = self.query_fasta.sequences[sequence].findOrfs(min_length=min_length, search_rev_compl=search_rev_compl)
+            orfs = self.query_fasta.sequences[sequence].findOrfs(self.blast, min_length=min_length, search_rev_compl=search_rev_compl)
             if self.verbosity > 1: print("", "Open reading frames:", len(orfs), "over", min_length, "bp")
             # first, remove overlaps, iterating from the longest ORFs, removing shorter ones in any overlap
             orfs = sorted(orfs, key=lambda x: x.length, reverse=True)
@@ -458,7 +496,7 @@ class OrfFinder:
             # finally, adjust start codon for each ORF
             if self.verbosity > 1: print("", "Adjusting start codon by tBLASTn checks:")
             for orf in orfs:
-                changed, index = orf.blastTestStart(self.blast)
+                changed, index = orf.selectBestByBlast(self.blast)
                 if self.verbosity > 1 and changed: print("", "", "Changed start codon:", orf.sequenceName(), "to methionine", index + 1)
             if len(orfs) > 0:
                 result[sequence] = orfs
@@ -479,7 +517,7 @@ class OrfFinder:
         result = {}
         for sequence in self.query_fasta.sequences:
             if self.verbosity > 1: print("Sequence:", sequence)
-            orfs = self.query_fasta.sequences[sequence].findOrfs(min_length=min_length, search_rev_compl=False)
+            orfs = self.query_fasta.sequences[sequence].findOrfs(self.blast, min_length=min_length, search_rev_compl=False)
             if self.verbosity > 1: print("", "Open reading frames:", len(orfs), "over", min_length, "bp")
             if len(orfs) > 0:
                 longest = sorted(orfs, key=lambda x: x.length, reverse=True)[0] # longest ORF found
@@ -497,7 +535,7 @@ class OrfFinder:
                 # adjust start codon for each unique hit
                 if self.verbosity > 1: print("", "Adjusting start codon by tBLASTn checks:")
                 for hit in hits:
-                    changed, index = hit.blastTestStart(self.blast)
+                    changed, index = hit.selectBestByBlast(self.blast)
                     if self.verbosity > 1 and changed: print("", "", "Changed start codon:", hit.sequenceName(), "to methionine", index + 1)
                 result[sequence] = hits
             else:
@@ -514,7 +552,7 @@ class OrfFinder:
             # orfs = [loading function]
             exit("Not implemented!!!")
             for orf in orfs:
-                changed, index = orf.blastTestStart(self.blast)
+                changed, index = orf.selectBestByBlast(self.blast)
                 if self.verbosity > 1 and changed: print("", "", "Changed start codon:", orf.sequenceName(), "to methionine index", index)
             if len(orfs) > 0:
                 result[sequence] = orfs
