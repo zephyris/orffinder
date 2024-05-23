@@ -1,7 +1,7 @@
 from .orffinder import *
 import argparse
 
-if __name__ == "__main__":
+def main():
     parser = argparse.ArgumentParser(description="Find open reading frames (ORFs) in the given sequence.")
     parser.add_argument('reference_genome', type=str, help="""The path to a FASTA file containing the reference genome used to cross-reference found ORFs against using tBLASTn.""")
     parser.add_argument('query_sequences', type=str, help="""The path to a FASTA file containing sequences ORFs should be found in. This could be e.g. a full genome or a set of mRNA sequences.""")
@@ -14,3 +14,6 @@ if __name__ == "__main__":
         results = orffinder.bestOrf()
     elif args.mode == "all":
         results = orffinder.allGoodOrfs()
+
+if __name__ == "__main__":
+    main()
