@@ -150,7 +150,7 @@ class Orf:
     ORF object, used by NuclSequence, representing a single open reading frame in a DNA sequence with a maximal extent start and stop and alternative start codons.
     Works with the forward strand, so reverse complement the sequence if necessary and coordinates are in the reverse direction.
     """
-    def __init__(self, sequence:str, start:int, stop:int, forward:str, altstarts:list=[]):
+    def __init__(self, sequence: "NuclSequence" | "ProtSequence", start:int, stop:int, forward:str, altstarts:list=[]):
         self.sequence = sequence # parent chromosome/contig/mRNA sequence
         self.start = start
         self.stop = stop

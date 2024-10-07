@@ -7,7 +7,7 @@ class GffOutput:
         self.gff: geffa.GffFile = geffa.GffFile(fasta_file=query_fasta_file)
     
     def add_orf(self, orf: Orf):
-        sequence_region = self.gff.sequence_regions[orf.sequence.sequencename]
+        sequence_region = self.gff.sequence_regions[orf.sequence.sequenceName()]
         if orf.forward:
             gff_start = orf.start + 1
             gff_end = orf.stop + 1
