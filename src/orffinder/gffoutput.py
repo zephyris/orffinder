@@ -17,7 +17,7 @@ class GffOutput:
             gff_start = sequence_length - orf.stop
             gff_end = sequence_length - orf.start
             gff_strand = '-'
-        gene_name = orf.orfname()
+        gene_name = orf.name
         geffa.geffa.GeneNode(-1, sequence_region, "orffinder", 'gene', gff_start, gff_end, '0.0', gff_strand, '.', f'ID={gene_name}')
         geffa.geffa.MRNANode(-1, sequence_region, "orffinder", 'mRNA', gff_start, gff_end, '0.0', gff_strand, '.', f'ID={gene_name}.1;Parent={gene_name}')
         geffa.geffa.CDSNode(-1, sequence_region, "orffinder", 'CDS', gff_start, gff_end, '0.0', gff_strand, '0', f'ID={gene_name}.1-CDS1;Parent={gene_name}.1')
